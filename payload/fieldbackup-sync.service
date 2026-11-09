@@ -1,0 +1,9 @@
+[Unit]
+Description=FieldBackup automatic SMB synchronization
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/fieldbackup-sync/sync.sh
+TimeoutStartSec=infinity

@@ -1,0 +1,13 @@
+[Unit]
+Description=FieldBackup OLED Status Display
+After=systemd-journald.service sd-field-backup.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/fieldbackup-oled/display.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+

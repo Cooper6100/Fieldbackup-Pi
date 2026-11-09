@@ -1,0 +1,11 @@
+[Unit]
+Description=Check for FieldBackup home SMB synchronization
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+Unit=fieldbackup-sync.service
+
+[Install]
+WantedBy=timers.target
