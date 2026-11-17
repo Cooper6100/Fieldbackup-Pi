@@ -1,38 +1,42 @@
 # FieldBackup Pi
 
-Portable, checksum-verified SD-card, USB-media and DJI camera backups for a Raspberry Pi 5 booting from NVMe.
+Portable Raspberry Pi 5 backup station for SD cards, USB camera media and DJI storage, with SHA-256 verification, a dedicated NVMe backup SSD, optional OLED, home SMB synchronization and conditional shutdown.
 
-> **v0.1.0 beta — untested on a clean Pi.** The current hardware configuration uses an SSD1306 128×64 I²C OLED (0x3c) and three LEDs on GPIO BCM 17/27/22. Argon UPS telemetry and low-battery shutdown are **not implemented**.
+> **Beta software.** Test with disposable media and verify copies independently before trusting it with irreplaceable footage.
 
 ## Features
-- Automatically detects USB FAT/exFAT partitions and whole-disk volumes, including DJI Neo 2 mass storage.
-- Copies `DCIM` content from sources mounted read-only to NVMe, SHA-256-verifying every new copy; skips identical destination files.
-- DJI Neo 2 uses a fixed destination for incremental backup. Other media use date/volume folders (incremental within each day only).
-- Safe unmount, status LEDs, OLED status and optional five-minute SMB synchronization.
-- No automatic deletion of source media.
+- Automatically imports FAT/exFAT SD and USB media with a `DCIM` folder
+- Copies to `/mnt/media/SD-Backups` on a **separate NVMe backup filesystem**
+- SHA-256 verifies new files, skips identical copies and never deletes source media
+- Optional SSD1306 OLED and status LEDs
+- Optional home SMB synchronization (five-minute timer)
+- Optional automatic shutdown after a verified backup and 180 seconds idle on an approved away Wi-Fi profile
+- Shutdown watchdog **disabled by default**; its default setting is **dry run**
 
 ## Requirements
-Raspberry Pi 5, 64-bit Raspberry Pi OS with root filesystem on NVMe, adequate power, and internet access for apt. Optional SSD1306 OLED and LEDs need appropriate wiring and current-limiting resistors. Check GPIO conflicts with any HAT or case before connecting.
+Raspberry Pi 5 with 64-bit Raspberry Pi OS booting from NVMe, a separate mounted backup NVMe at `/mnt/media`, stable power, and a USB SD-card reader. The installer is **for a fresh Pi only** and refuses to overwrite an existing FieldBackup installation.
 
 ## Installation
 ```bash
+git clone https://github.com/Cooper6100/Fieldbackup-Pi.git
+cd Fieldbackup-Pi
 sudo ./install.sh
-sudo ./configure-smb.sh  # optional; asks for SMB share and credentials
+sudo ./configure-smb.sh  # optional
 ```
-Reboot if the installer enables I²C. Check `systemctl status sd-field-backup.service fieldbackup-oled.service fieldbackup-sync.timer` and `journalctl -u sd-field-backup.service -f`.
 
-## Backup destination
-`/srv/sd-backups` on the same NVMe root filesystem. The installer sets the root filesystem UUID automatically and refuses installation over an existing FieldBackup deployment.
+**Before installing:** mount your dedicated backup NVMe at `/mnt/media` using its own UUID in `/etc/fstab`. Never format a disk without checking its contents and identity.
 
-## Important safety notes
-- **Beta software**: test with expendable media and verify files independently before relying on it.
-- Sync is optional. Its destination must support the temporary-file and hard-link operations used by the current sync script; some SMB servers may not. The sync feature has not been validated across SMB implementations.
-- Device matching is broad: any USB FAT/exFAT volume can be examined, but only media with a `DCIM` directory are copied. Devices lacking `DCIM` report an error.
-- Do not disconnect power or media during a transfer. The UPS is power-only until separately integrated and tested.
-- Configuration and credentials live in `/etc`, not in this repository. Never commit private files, tokens or media.
+For SMB and shutdown, copy `payload/fieldbackup-network.example.json` to `/etc/fieldbackup-network.json` and configure your own home network and approved hotspot profiles. **Never commit your local configuration or credentials.**
 
-## Contributing
-Issues and pull requests are welcome. Please remove personal data from logs and screenshots before posting.
+See the [full installation and operating manual](docs/MANUAL.md) for mount setup, network configuration, logs, safe shutdown activation, and troubleshooting.
+
+## Safety
+- The optional watchdog is not automatically enabled and starts in dry-run mode.
+- A verified backup is not a substitute for keeping an independent copy.
+- Source media are never intentionally deleted.
+- Cards mounted read-only by another service are not automatically unmounted by the importer.
+- SMB synchronization requires a share supporting the file operations used by the sync script.
+- UPS telemetry and low-battery shutdown are not implemented.
 
 ## License
-MIT. See [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).
