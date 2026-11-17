@@ -33,7 +33,7 @@ def partitions(cfg):
     def visit(node, disk=None):
         if node.get('type') == 'disk':
             disk = node
-        if disk and disk.get('tran') == 'usb' and node.get('type') in ('part','disk'):
+        if disk and disk.get('tran') in ('usb', 'mmc') and node.get('type') in ('part','disk'):
             if (node.get('fstype') or '').lower() in ('exfat','vfat','fat','fat32'):
                 result[node['name']] = node
         for child in node.get('children', []):
@@ -101,12 +101,15 @@ class Lights:
 def check_destination(cfg):
     dest = Path(cfg['destination'])
     expected_uuid = cfg['root_uuid']
+    if not dest.is_dir() or dest.is_symlink():
+        raise RuntimeError('Backup directory missing or unsafe')
     actual_uuid = cmd(['findmnt','-n','-o','UUID','-T',str(dest)]).stdout.strip()
-    root_uuid = cmd(['findmnt','-n','-o','UUID','-T','/']).stdout.strip()
+    source = cmd(['findmnt','-n','-o','SOURCE','-T',str(dest)]).stdout.strip()
     root_source = cmd(['findmnt','-n','-o','SOURCE','-T','/']).stdout.strip()
-    if not dest.is_dir() or dest.is_symlink(): raise RuntimeError('Backup directory missing or unsafe')
-    if actual_uuid != expected_uuid or root_uuid != expected_uuid or not root_source.startswith('/dev/nvme'):
-        raise RuntimeError(f'Backup destination is not the configured NVMe OS filesystem: {root_source}')
+    if actual_uuid != expected_uuid:
+        raise RuntimeError('Backup filesystem UUID mismatch')
+    if not source.startswith('/dev/nvme') or not root_source.startswith('/dev/nvme'):
+        raise RuntimeError('OS and backup destination must be on NVMe')
     if shutil.disk_usage(dest).free < 15*1024**3: raise RuntimeError('Less than 15 GiB free')
     return dest
 
@@ -159,6 +162,7 @@ def import_card(dev, part, cfg, lights):
                 success = False
                 log.error('Could not unmount %s: %s',dev,e)
     if not success: raise RuntimeError('Backup did not finish safely')
+    log.info('Backup completed safely for %s', dev)
     lights.show('green')
 
 def main():
