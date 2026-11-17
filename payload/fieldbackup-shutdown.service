@@ -1,0 +1,11 @@
+[Unit]
+Description=FieldBackup conditional shutdown watchdog
+After=sd-field-backup.service network.target
+Requires=sd-field-backup.service
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u /opt/fieldbackup-shutdown/watchdog.py
+Restart=on-failure
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
