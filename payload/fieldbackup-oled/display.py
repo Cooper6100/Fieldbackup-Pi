@@ -72,7 +72,7 @@ def draw_screen():
             draw.text((0, 41), f"FILES: {processed}", font=font, fill="white")
 
         elif state == "COMPLETE":
-            draw.text((0, 29), "Safe to remove SD", font=font, fill="white")
+            draw.text((0, 29), "Backup verified", font=font, fill="white")
             draw.text(
                 (0, 41),
                 f"{copied} NEW / {skipped} SAME",
@@ -118,10 +118,10 @@ def handle_log(line):
             state = "VERIFYING"
             message = "Finalizing backup"
 
-    elif "Safely unmounted" in line:
+    elif "Backup completed safely for" in line:
         if verified and not last_error:
             state = "COMPLETE"
-            message = "Safe to remove SD"
+            message = "Backup verified"
             completed_at = time.monotonic()
         # Unmounting without verification is not success.
         # Wait for the actual failure log.
