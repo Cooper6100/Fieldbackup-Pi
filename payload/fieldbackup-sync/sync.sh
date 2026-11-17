@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SOURCE="/srv/sd-backups"
+SOURCE="$(python3 -c 'import json; print(json.load(open("/etc/sd-field-backup.json"))["destination"])')"
 MOUNT="/mnt/home-smb"
 CREDS="/etc/fieldbackup-smb.credentials"
 CONFIG="/etc/fieldbackup-smb.conf"
@@ -14,6 +14,7 @@ TARGET="$MOUNT/$REMOTE_DIR"
 LOCK="/run/lock/fieldbackup-transfer.lock"
 
 MOUNTED_BY_US=0
+NETWORK_CONFIG="/etc/fieldbackup-network.json"
 
 log() {
     echo "FieldBackup Sync: $*"
@@ -27,6 +28,28 @@ cleanup() {
 
 trap cleanup EXIT
 trap 'log "ERROR: Synchronization failed (line $LINENO)"' ERR
+
+# Fail closed: SMB sync only on explicitly configured home network.
+[[ -f "$NETWORK_CONFIG" ]] || { log "Home network not configured; skipping"; exit 0; }
+HOME_SSID="$(python3 -c 'import json; print(json.load(open("/etc/fieldbackup-network.json"))["home_ssid"])')"
+HOME_IP="$(python3 -c 'import json; print(json.load(open("/etc/fieldbackup-network.json"))["home_router_ip"])')"
+HOME_MAC="$(python3 -c 'import json; print(json.load(open("/etc/fieldbackup-network.json"))["home_router_mac"].lower())')"
+HOME=0
+if command -v nmcli >/dev/null 2>&1; then
+    CONNECTION="$(nmcli -g GENERAL.CONNECTION device show wlan0 2>/dev/null || true)"
+    STATE="$(nmcli -g GENERAL.STATE device show wlan0 2>/dev/null || true)"
+    [[ "$CONNECTION" == "$HOME_SSID" && "$STATE" == 100* ]] && HOME=1
+fi
+if (( ! HOME )); then
+    ping -c 1 -W 1 "$HOME_IP" >/dev/null 2>&1 || true
+    ROUTER_MAC="$(ip -4 neigh show "$HOME_IP" | awk '{print tolower($5)}')"
+    [[ -n "$HOME_MAC" && "$ROUTER_MAC" == "$HOME_MAC" ]] && HOME=1
+fi
+(( HOME )) || { log "Not on home network; skipping"; exit 0; }
+
+EXPECTED_UUID="$(python3 -c 'import json; print(json.load(open("/etc/sd-field-backup.json"))["root_uuid"])')"
+ACTUAL_UUID="$(findmnt -n -o UUID -T "$SOURCE" || true)"
+[[ "$ACTUAL_UUID" == "$EXPECTED_UUID" ]] || { log "Backup NVMe missing or incorrect"; exit 1; }
 
 SMB_HOST="${SERVER#//}"
 SMB_HOST="${SMB_HOST%%/*}"
