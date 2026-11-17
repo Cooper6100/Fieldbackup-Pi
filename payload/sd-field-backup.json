@@ -3,7 +3,7 @@
     "0bda:0306",
     "05e3:0764"
   ],
-  "destination": "/srv/sd-backups",
+  "destination": "/mnt/media/SD-Backups",
   "root_uuid": "SET_BY_INSTALLER",
   "gpio_pins": {
     "blue": 17,
