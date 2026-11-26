@@ -1,0 +1,44 @@
+name: Test and package
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v7.1.0
+        with:
+          python-version: '3.13'
+      - name: Run regression tests
+        run: python -m unittest discover -s tests -v
+      - name: Check Python and shell syntax
+        run: |
+          python -m compileall -q payload tests
+          for script in ./*.sh scripts/*.sh payload/fieldbackup-sync/*.sh; do bash -n "$script"; done
+      - name: Build and smoke-test installation package
+        run: |
+          ./scripts/package.sh "$RUNNER_TEMP/fieldbackup-package"
+          cd "$RUNNER_TEMP/fieldbackup-package"
+          sha256sum -c FieldBackup-v0.2.0.tar.gz.sha256
+          tar -xzf FieldBackup-v0.2.0.tar.gz
+          cd FieldBackup-v0.2.0
+          python -m unittest discover -s tests -v
+          ./install.sh
+          ./upgrade.sh
+          ./rollback.sh
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: FieldBackup-v0.2.0
+          path: |
+            ${{ runner.temp }}/fieldbackup-package/FieldBackup-v0.2.0.tar.gz
+            ${{ runner.temp }}/fieldbackup-package/FieldBackup-v0.2.0.tar.gz.sha256

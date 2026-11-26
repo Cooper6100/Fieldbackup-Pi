@@ -5,7 +5,7 @@ read -r -p 'SMB share (e.g. //nas.example.local/backups): ' SERVER
 [[ $SERVER =~ ^//[A-Za-z0-9._-]+/[A-Za-z0-9._$-]+$ ]] || { echo 'Invalid SMB share'; exit 1; }
 read -r -p 'Subfolder on share [FieldBackup]: ' REMOTE_DIR
 REMOTE_DIR=${REMOTE_DIR:-FieldBackup}
-[[ $REMOTE_DIR =~ ^[A-Za-z0-9._-]+$ ]] || { echo 'Invalid subfolder'; exit 1; }
+[[ $REMOTE_DIR =~ ^[A-Za-z0-9_-]([A-Za-z0-9._-]*[A-Za-z0-9_-])?$ ]] || { echo 'Invalid subfolder'; exit 1; }
 read -r -p 'SMB username: ' USERNAME
 [[ -n $USERNAME && $USERNAME != *$'\n'* ]] || exit 1
 read -r -s -p 'SMB password: ' PASSWORD; echo

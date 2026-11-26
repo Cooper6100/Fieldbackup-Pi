@@ -1,9 +1,10 @@
 [Unit]
 Description=Offline SD to NVMe verified field backup
 After=local-fs.target
-RequiresMountsFor=/mnt/media/SD-Backups
 [Service]
 Type=simple
+RuntimeDirectory=sd-field-backup
+PrivateMounts=yes
 ExecStart=/usr/bin/python3 -u /opt/sd-field-backup/backup.py
 Restart=on-failure
 RestartSec=5

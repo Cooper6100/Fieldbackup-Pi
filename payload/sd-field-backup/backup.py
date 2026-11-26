@@ -1,193 +1,282 @@
 #!/usr/bin/env python3
+"""Read-only FAT/exFAT media importer."""
 import fcntl
-"""Read-only SD-card importer, SHA-256 verified, for a Pi booted from NVMe."""
-import hashlib, json, logging, os, re, shutil, signal, subprocess, time
+import json
+import logging
+import os
+import re
+import signal
+import subprocess
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
-CONFIG = Path('/etc/sd-field-backup.json')
+from storage import (
+    STAGING, backup_volume, cleanup_staging, command, configuration,
+    copy_verified, directory, mount_id, mount_info, pinned, scan_files,
+)
+
+LOCK = "/run/lock/fieldbackup-transfer.lock"
+RUNTIME = Path("/run/sd-field-backup")
 STOP = False
+log = logging.getLogger("sd-field-backup")
+
 
 def stop(*_):
     global STOP
     STOP = True
-signal.signal(signal.SIGTERM, stop)
-signal.signal(signal.SIGINT, stop)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-log = logging.getLogger('sd-field-backup')
 
-def cmd(args, check=True):
-    return subprocess.run(args, text=True, capture_output=True, check=check)
+
+def check_stop():
+    if STOP:
+        raise InterruptedError("Importer stopping")
+
+
+def status(state, message="", **progress):
+    record = dict(state=state, message=message, updated=time.monotonic(), **progress)
+    temporary = RUNTIME / "status.tmp"
+    temporary.write_text(json.dumps(record))
+    temporary.replace(RUNTIME / "status.json")
+
+
+def clock_source(cfg):
+    settings = cfg.get("clock", {})
+    now = time.time()
+    if now < settings.get("minimum_epoch", 1767225600):
+        raise RuntimeError("System date is too old")
+    try:
+        if command("timedatectl", "show", "-p", "NTPSynchronized", "--value") == "yes":
+            return "NTP"
+    except (subprocess.SubprocessError, OSError):
+        pass
+    rtc = settings.get("rtc_device", "rtc0")
+    if not re.fullmatch(r"rtc[0-9]+", rtc):
+        raise ValueError("Invalid RTC device name")
+    try:
+        rtc_time = int((Path("/sys/class/rtc") / rtc / "since_epoch").read_text())
+    except (OSError, ValueError):
+        raise RuntimeError("RTC unavailable and NTP unsynchronized") from None
+    if rtc_time < settings.get("minimum_epoch", 1767225600):
+        raise RuntimeError("RTC date is too old")
+    if abs(rtc_time - now) > settings.get("max_rtc_drift_seconds", 120):
+        raise RuntimeError("System clock and RTC disagree")
+    return rtc
+
 
 def usb_id(dev):
-    node = (Path('/sys/class/block') / Path(dev).name).resolve()
+    node = (Path("/sys/class/block") / Path(dev).name).resolve()
     for parent in (node, *node.parents):
-        vendor, product = parent/'idVendor', parent/'idProduct'
-        if vendor.exists() and product.exists():
-            return f'{vendor.read_text().strip().lower()}:{product.read_text().strip().lower()}'
+        try:
+            vendor = (parent / "idVendor").read_text().strip().lower()
+            product = (parent / "idProduct").read_text().strip().lower()
+            return f"{vendor}:{product}"
+        except FileNotFoundError:
+            continue
     return None
 
+
 def partitions(cfg):
-    """Find USB FAT/exFAT volumes (partitions or whole-disk filesystems)."""
-    data = json.loads(cmd(['lsblk','-J','-p','-o','NAME,TYPE,FSTYPE,MOUNTPOINT,UUID,TRAN']).stdout)
+    data = json.loads(command("lsblk", "-J", "-p", "-o",
+                              "NAME,TYPE,FSTYPE,UUID,TRAN,MAJ:MIN,MOUNTPOINTS"))
+    allowed = set(cfg.get("reader_ids", []))
     result = {}
+
     def visit(node, disk=None):
-        if node.get('type') == 'disk':
+        if node["type"] == "disk":
             disk = node
-        if disk and disk.get('tran') in ('usb', 'mmc') and node.get('type') in ('part','disk'):
-            if (node.get('fstype') or '').lower() in ('exfat','vfat','fat','fat32'):
-                result[node['name']] = node
-        for child in node.get('children', []):
+        if (disk and (disk["tran"] in ("usb", "mmc") or Path(disk["name"]).name.startswith("mmcblk"))
+                and node["type"] in ("part", "disk")
+                and node["fstype"] in ("exfat", "vfat", "fat", "fat32")):
+            dev = node["name"]
+            reader = usb_id(dev)
+            if not cfg.get("restrict_readers", False) or reader in allowed:
+                result[dev] = node | {"reader": reader}
+        for child in node.get("children", []):
             visit(child, disk)
-    for node in data.get('blockdevices', []):
+
+    for node in data["blockdevices"]:
         visit(node)
     return result
 
-def sha256(path):
-    h = hashlib.sha256()
-    with open(path,'rb') as f:
-        for block in iter(lambda: f.read(4*1024*1024), b''): h.update(block)
-    return h.hexdigest()
 
-def scan_files(source):
-    for root, dirs, files in os.walk(source, followlinks=False):
-        dirs[:] = sorted(d for d in dirs if not d.startswith('.') and not (Path(root)/d).is_symlink())
-        for name in sorted(files):
-            if name.startswith('.'): continue
-            p = Path(root)/name
-            if p.is_file() and not p.is_symlink(): yield p
-
-def copy_verified(src, dst):
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    src_hash = sha256(src)
-    if dst.exists():
-        if dst.is_file() and not dst.is_symlink() and sha256(dst) == src_hash: return 'SKIPPED'
-        raise RuntimeError(f'Conflicting existing destination: {dst}')
-    if shutil.disk_usage(dst.parent).free < src.stat().st_size + 15*1024**3:
-        raise RuntimeError('Insufficient free space; reserve 15 GiB')
-    temp = dst.with_name(dst.name+'.partial')
-    if temp.exists():
-        if temp.is_symlink() or not temp.is_file(): raise RuntimeError(f'Unsafe partial file: {temp}')
-        temp.unlink()
+@contextmanager
+def source_volume(dev, part):
+    existing = [path for path in (part.get("mountpoints") or []) if path]
+    owned = not existing
+    if owned:
+        source = RUNTIME / Path(dev).name
+        source.mkdir(exist_ok=True)
+        command("mount", "-o", "ro,nosuid,nodev,noexec", dev, str(source))
+    else:
+        if len(existing) != 1:
+            raise RuntimeError(f"Ambiguous source mounts for {dev}")
+        source = Path(existing[0])
     try:
-        with open(src,'rb') as reader, open(temp,'xb') as writer:
-            shutil.copyfileobj(reader, writer, 4*1024*1024)
-            writer.flush(); os.fsync(writer.fileno())
-        if sha256(temp) != src_hash: raise RuntimeError(f'SHA-256 mismatch: {src}')
-        os.replace(temp,dst)
-        fd = os.open(dst.parent,os.O_RDONLY|os.O_DIRECTORY)
-        try: os.fsync(fd)
-        finally: os.close(fd)
-        return 'COPIED'
+        with directory(source) as fd:
+            info = mount_info(source)
+            if (info["target"] != str(source) or info["fsroot"] != "/"
+                    or int(info["id"]) != mount_id(fd) or info["maj:min"] != part["maj:min"]
+                    or (info["uuid"] or "").lower() != (part.get("uuid") or "").lower()
+                    or "ro" not in info["options"].split(",")):
+                raise RuntimeError(f"Expected read-only source mount for {dev}")
+            yield fd
     finally:
-        if temp.exists(): temp.unlink()
+        if owned:
+            try:
+                command("umount", str(source))
+            except (OSError, subprocess.SubprocessError):
+                log.exception("Could not unmount %s", dev)
+                raise
+
+
+def card_folder(part):
+    uuid = part.get("uuid")
+    if not uuid or not re.fullmatch(r"[A-Za-z0-9-]{1,80}", uuid):
+        raise RuntimeError("Source volume has no usable filesystem UUID")
+    return Path("Cards") / uuid.lower()
+
+
+def import_card(dev, part, cfg, lights):
+    status("CHECKING", "Clock and storage")
+    try:
+        clock = clock_source(cfg)
+    except RuntimeError as error:
+        status("CLOCK ERROR", str(error))
+        raise
+    reserve = int(cfg.get("reserve_gib", 15) * 1024**3)
+    if reserve < 0:
+        raise ValueError("Storage reserve cannot be negative")
+    with backup_volume(cfg) as dest, source_volume(dev, part) as card:
+        status("SCANNING", Path(dev).name)
+        root = pinned(card)
+        files = []
+        for src in scan_files(root):
+            check_stop()
+            files.append(src.relative_to(root))
+        if not files:
+            raise RuntimeError("No visible files on media")
+        folder = card_folder(part)
+        log.info("Starting media backup %s -> %s (clock: %s)", dev, folder, clock)
+        lights.show("copying")
+        copied = skipped = conflicts = 0
+        with directory(STAGING, below=dest, create=True) as stage:
+            cleanup_staging(stage)
+            for index, rel in enumerate(files):
+                check_stop()
+                status("COPY / VERIFY", rel.name, done=index, total=len(files))
+                with directory(rel.parent, below=card) as source_parent:
+                    with directory(folder / rel.parent, below=dest, create=True) as parent:
+                        outcome = copy_verified(pinned(source_parent) / rel.name, parent,
+                                                rel.name, stage, reserve=reserve, stop=check_stop,
+                                                source_parent=source_parent)
+                copied += outcome != "SKIPPED"
+                skipped += outcome == "SKIPPED"
+                conflicts += outcome == "CONFLICT"
+                log.info("%s %r", outcome, str(rel))
+        # A pinned path cannot fall through to the OS disk. Also confirm that this
+        # is still the visible destination before reporting verified completion.
+        with backup_volume(cfg) as current:
+            if mount_id(current) != mount_id(dest):
+                raise RuntimeError("Backup mount changed during import")
+        status("FINALIZING", "Closing source", done=len(files), total=len(files))
+        log.info("Verified backup of %s: %d copied, %d identical, %d conflicts",
+                 dev, copied, skipped, conflicts)
+    log.info("Backup completed safely for %s", dev)
+    status("COMPLETE", "Verified; unmount RO" if any(part.get("mountpoints") or [])
+           else "Verified; remove card", done=len(files), total=len(files),
+           copied=copied, skipped=skipped, conflicts=conflicts)
+    lights.show("green")
+
 
 class Lights:
     def __init__(self, cfg):
         self.leds = {}
         try:
             from gpiozero import LED
-            for color, pin in cfg.get('gpio_pins',{}).items(): self.leds[color] = LED(int(pin))
-        except Exception as e:
-            log.warning('GPIO LEDs unavailable: %s',e)
-            self.leds = {}
+            for color, pin in cfg.get("gpio_pins", {}).items():
+                self.leds[color] = LED(int(pin))
+        except Exception as error:
+            log.warning("GPIO LEDs unavailable: %s", error)
+            self.close()
+            self.leds.clear()
+
     def show(self, state):
-        for led in self.leds.values(): led.off()
-        if state == 'copying' and 'blue' in self.leds:
-            self.leds['blue'].blink(on_time=.3,off_time=.3,background=True)
-        elif state in self.leds: self.leds[state].on()
+        for led in self.leds.values():
+            led.off()
+        if state == "copying" and "blue" in self.leds:
+            self.leds["blue"].blink(on_time=.3, off_time=.3, background=True)
+        elif state in self.leds:
+            self.leds[state].on()
+
     def close(self):
-        for led in self.leds.values(): led.close()
+        for led in self.leds.values():
+            led.close()
 
-def check_destination(cfg):
-    dest = Path(cfg['destination'])
-    expected_uuid = cfg['root_uuid']
-    if not dest.is_dir() or dest.is_symlink():
-        raise RuntimeError('Backup directory missing or unsafe')
-    actual_uuid = cmd(['findmnt','-n','-o','UUID','-T',str(dest)]).stdout.strip()
-    source = cmd(['findmnt','-n','-o','SOURCE','-T',str(dest)]).stdout.strip()
-    root_source = cmd(['findmnt','-n','-o','SOURCE','-T','/']).stdout.strip()
-    if actual_uuid != expected_uuid:
-        raise RuntimeError('Backup filesystem UUID mismatch')
-    if not source.startswith('/dev/nvme') or not root_source.startswith('/dev/nvme'):
-        raise RuntimeError('OS and backup destination must be on NVMe')
-    if shutil.disk_usage(dest).free < 15*1024**3: raise RuntimeError('Less than 15 GiB free')
-    return dest
-
-def import_card(dev, part, cfg, lights):
-    dest = check_destination(cfg)
-    if part.get('mountpoint'):
-        source = Path(part['mountpoint'])
-        opts = cmd(['findmnt','-n','-o','OPTIONS','--target',str(source)]).stdout.strip().split(',')
-        if 'ro' not in opts: raise RuntimeError(f'{dev} already mounted read-write at {source}')
-        owned = False
-    else:
-        source = Path('/run/sd-field-backup')/Path(dev).name
-        source.mkdir(parents=True,exist_ok=True)
-        cmd(['mount','-o','ro,nosuid,nodev,noexec',dev,str(source)])
-        owned = True
-    success = False
-    try:
-        card_id = re.sub(r'[^A-Za-z0-9._-]','_',part.get('uuid') or (usb_id(dev) or Path(dev).name))[:80]
-        from datetime import datetime
-        dcim = source / 'DCIM'
-        if not dcim.is_dir() or dcim.is_symlink():
-            raise RuntimeError(f'DCIM folder not found on {dev}')
-
-        backup_date = datetime.now().strftime('%Y-%m-%d')
-
-        if usb_id(dev) == '2ca3:0020':
-            target = dest / 'DJI-Neo-2'
-        else:
-            target = dest / backup_date / card_id
-
-        target.mkdir(parents=True, exist_ok=True)
-        log.info('Starting DCIM backup %s -> %s', dev, target)
-        lights.show('copying')
-        copied = skipped = 0
-        for src in scan_files(dcim):
-            if STOP: raise RuntimeError('Stopped during import')
-            rel = src.relative_to(dcim)
-            status = copy_verified(src,target/rel)
-            copied += status == 'COPIED'; skipped += status == 'SKIPPED'
-            log.info('%s %s',status,rel)
-        os.sync()
-        log.info('Verified backup of %s: %d copied, %d already identical',dev,copied,skipped)
-        success = True
-    finally:
-        if owned:
-            try:
-                cmd(['umount',str(source)])
-                log.info('Safely unmounted %s',dev)
-            except Exception as e:
-                success = False
-                log.error('Could not unmount %s: %s',dev,e)
-    if not success: raise RuntimeError('Backup did not finish safely')
-    log.info('Backup completed safely for %s', dev)
-    lights.show('green')
 
 def main():
-    cfg = json.loads(CONFIG.read_text())
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    cfg = configuration()
     lights = Lights(cfg)
-    seen = set()
-    log.info('Field backup started; readers=%s destination=%s',cfg['reader_ids'],cfg['destination'])
+    completed = set()
+    retry = {}
+    status("STARTING")
+    idle = None
     try:
         while not STOP:
             try:
                 found = partitions(cfg)
-                active = set(found)
-                seen &= active
-                for dev in sorted(active-seen):
-                    seen.add(dev)
+                active = {(dev, part.get("uuid"), part["maj:min"]) for dev, part in found.items()}
+                completed &= active
+                retry = {key: due for key, due in retry.items() if key in active}
+                if not active:
                     try:
-                        with open('/run/lock/fieldbackup-transfer.lock', 'a') as lock:
-                            fcntl.flock(lock, fcntl.LOCK_EX)
-                            import_card(dev,found[dev],cfg,lights)
-                    except Exception as e:
-                        log.exception('Backup failed for %s: %s',dev,e)
-                        lights.show('red')
-            except Exception as e:
-                log.exception('Detection error: %s',e)
-                lights.show('red')
-            time.sleep(3)
-    finally: lights.close()
-if __name__ == '__main__': main()
+                        with backup_volume(cfg) as dest:
+                            free = os.fstatvfs(dest)
+                        ready = ("READY", f"{free.f_bavail * free.f_frsize // 1024**3} GiB free")
+                    except (RuntimeError, OSError, subprocess.SubprocessError):
+                        ready = ("STORAGE ERROR", "Check backup SSD")
+                    if ready[0] == "READY":
+                        try:
+                            clock_source(cfg)
+                        except RuntimeError:
+                            ready = ("CLOCK ERROR", "Check RTC / NTP")
+                    if idle != ready:
+                        status(*ready)
+                        lights.show("ready" if ready[0] == "READY" else "red")
+                        idle = ready
+                else:
+                    idle = None
+                for key in sorted(active - completed, key=lambda item: item[0]):
+                    if STOP or retry.get(key, 0) > time.monotonic():
+                        continue
+                    dev = key[0]
+                    try:
+                        with open(LOCK, "a") as lock:
+                            try:
+                                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            except BlockingIOError:
+                                continue
+                            import_card(dev, found[dev], cfg, lights)
+                        completed.add(key)
+                    except Exception as error:
+                        log.exception("Backup failed for %s", dev)
+                        current = json.loads((RUNTIME / "status.json").read_text())
+                        if current["state"] != "CLOCK ERROR":
+                            status("BACKUP ERROR", str(error))
+                        lights.show("red")
+                        retry[key] = time.monotonic() + cfg.get("retry_seconds", 30)
+            except Exception:
+                log.exception("Detection error")
+                status("READER ERROR", "Check backup logs")
+                idle = None
+                lights.show("red")
+            if not STOP:
+                time.sleep(3)
+    finally:
+        lights.close()
+
+
+if __name__ == "__main__":
+    main()
