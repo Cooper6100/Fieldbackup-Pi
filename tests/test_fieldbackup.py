@@ -214,7 +214,8 @@ class ImportAndSyncCases(unittest.TestCase):
             (dest / storage.STAGING / ("a" * 32)).write_bytes(b"in flight")
             (dest / "legacy.partial").write_bytes(b"old staging")
             with patch("transfer.backup_volume", side_effect=lambda _: storage.directory(dest)):
-                with patch("transfer.configuration"), patch("transfer.status"):
+                with (patch("transfer.configuration", return_value={}), patch("transfer.status"),
+                      patch("transfer.MANIFEST", root / "manifest.sqlite3")):
                     info = {"target": str(share), "id": share_id, "source": "//server/share",
                             "fstype": "cifs", "fsroot": "/", "options": "rw"}
                     with patch("transfer.mount_info", return_value=info):

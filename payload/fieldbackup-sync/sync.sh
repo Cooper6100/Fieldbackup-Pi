@@ -68,6 +68,6 @@ if mountpoint -q "$MOUNT"; then
     exit 1
 fi
 timeout 30 mount -t cifs "$SERVER" "$MOUNT" \
-    -o "credentials=$CREDS,vers=3.0,iocharset=utf8,nosuid,nodev,noexec,soft,cache=none"
+    -o "credentials=$CREDS,vers=3.0,iocharset=utf8,nosuid,nodev,noexec,soft,cache=none,actimeo=0,serverino"
 MOUNTED_BY_US=1
 python3 "$TRANSFER" "$MOUNT" "$REMOTE_DIR" "$SERVER"

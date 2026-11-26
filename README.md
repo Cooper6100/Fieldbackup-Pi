@@ -14,7 +14,7 @@ Read the [operating manual](docs/MANUAL.md) for the mount, packages, RTC and OLE
 ./rollback.sh            # preview restoring the previous installation
 ```
 
-New imports go under `Cards/<volume-uuid>/` inside the configured destination. The upgrade keeps the existing backups and preserves your configured destination and UUID. Optional SMB sync independently copies published files, including earlier backup layouts. Keep the original media until you have checked an independent copy.
+New imports go under `Cards/<volume-uuid>/` inside the configured destination. The upgrade keeps the existing backups and preserves your configured destination and UUID. Optional SMB sync independently copies published files, including earlier backup layouts, and caches SHA-256 verification for unchanged files. It uses atomic no-replace rename on the SMB share. Keep the original media until you have checked an independent copy.
 
 ## Tests and package
 

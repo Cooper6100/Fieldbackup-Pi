@@ -178,7 +178,44 @@ def cleanup_staging(stage, *, remote=False):
     sync_directory(stage, remote)
 
 
-def copy_verified(src, parent, name, stage, *, reserve=0, stop=check_stop, remote=False, source_parent=None):
+def conflict_name(name, expected):
+    # Keep generated conflict names short even when the original name is long.
+    name_hash = hashlib.sha256(os.fsencode(name)).hexdigest()[:16]
+    return f"conflict-{name_hash}-{expected}{Path(name).suffix[:12]}"
+
+
+@contextmanager
+def staged_copy(reader, before, expected, stage, *, stop=check_stop, reserve=0, remote=False):
+    """Yield a flushed, independently verified temporary file on the target filesystem."""
+    if shutil.disk_usage(pinned(stage)).free < before.st_size + reserve:
+        raise RuntimeError("Insufficient free space after configured reserve")
+    temp = pinned(stage) / uuid4().hex
+    owned = False
+    try:
+        reader.seek(0)
+        with temp.open("x+b") as writer:
+            owned = True
+            for block in iter(lambda: reader.read(CHUNK), b""):
+                stop()
+                writer.write(block)
+            writer.flush()
+            os.fsync(writer.fileno())
+            with regular_file(temp, stage) as verified:
+                if digest(verified, stop) != expected:
+                    raise RuntimeError(f"SHA-256 verification failed: {reader.name}")
+            if fingerprint(before) != fingerprint(os.fstat(reader.fileno())):
+                raise RuntimeError("Source changed during copy")
+            os.utime(writer.fileno(), ns=(before.st_atime_ns, before.st_mtime_ns))
+            os.fsync(writer.fileno())
+        stop()
+        yield temp
+    finally:
+        if owned:
+            temp.unlink(missing_ok=True)
+            sync_directory(stage, remote)
+
+
+def copy_verified(src, parent, name, stage, *, reserve=0, stop=check_stop, source_parent=None):
     """Hash the source independently, verify the flushed copy, and publish without overwrite."""
     with regular_file(src, source_parent) as reader:
         before = os.fstat(reader.fileno())
@@ -186,55 +223,31 @@ def copy_verified(src, parent, name, stage, *, reserve=0, stop=check_stop, remot
         destination = pinned(parent) / name
         match = same_file(destination, parent, expected, stop)
         if match:
-            sync_directory(parent, remote)
+            sync_directory(parent)
             return "SKIPPED"
-        # Keep generated conflict names short even when the original name is long.
-        name_hash = hashlib.sha256(os.fsencode(name)).hexdigest()[:16]
-        conflict = pinned(parent) / f"conflict-{name_hash}-{expected}{Path(name).suffix[:12]}"
+        conflict = pinned(parent) / conflict_name(name, expected)
         if match is False and same_file(conflict, parent, expected, stop):
-            sync_directory(parent, remote)
+            sync_directory(parent)
             return "SKIPPED"
-        if shutil.disk_usage(pinned(stage)).free < before.st_size + reserve:
-            raise RuntimeError("Insufficient free space after configured reserve")
-        temp = pinned(stage) / uuid4().hex
-        try:
-            reader.seek(0)
-            with temp.open("x+b") as writer:
-                for block in iter(lambda: reader.read(CHUNK), b""):
-                    stop()
-                    writer.write(block)
-                writer.flush()
-                os.fsync(writer.fileno())
-                with regular_file(temp, stage) as verified:
-                    if digest(verified, stop) != expected:
-                        raise RuntimeError(f"SHA-256 verification failed: {src}")
-                after = os.fstat(reader.fileno())
-                if fingerprint(before) != fingerprint(after):
-                    raise RuntimeError(f"Source changed during copy: {src}")
-                os.utime(writer.fileno(), ns=(before.st_atime_ns, before.st_mtime_ns))
-                os.fsync(writer.fileno())
-            stop()
+        with staged_copy(reader, before, expected, stage, reserve=reserve, stop=stop) as temp:
             if match is None:
                 try:
                     os.link(temp, destination)
-                    sync_directory(parent, remote)
+                    sync_directory(parent)
                     return "COPIED"
                 except FileExistsError:
                     if same_file(destination, parent, expected, stop):
-                        sync_directory(parent, remote)
+                        sync_directory(parent)
                         return "SKIPPED"
             try:
                 os.link(temp, conflict)
-                sync_directory(parent, remote)
+                sync_directory(parent)
                 return "CONFLICT"
             except FileExistsError:
                 if same_file(conflict, parent, expected, stop):
-                    sync_directory(parent, remote)
+                    sync_directory(parent)
                     return "SKIPPED"
                 raise RuntimeError(f"Existing conflict copy differs: {conflict.name}")
-        finally:
-            temp.unlink(missing_ok=True)
-            sync_directory(stage, remote)
 
 
 def scan_files(root):
