@@ -5,10 +5,12 @@ import json
 import logging
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 
-CONFIG = Path("/etc/sd-field-backup.json")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "sd-field-backup"))
+from storage import backup_volume, configuration
 NETWORK_CONFIG = Path("/etc/fieldbackup-network.json")
 LOCK = Path("/run/lock/fieldbackup-transfer.lock")
 IDLE_SECONDS = 180
@@ -23,12 +25,8 @@ def run(args, timeout=10):
 
 def destination_ok():
     try:
-        cfg = json.loads(CONFIG.read_text())
-        dest = Path(cfg["destination"])
-        if not dest.is_dir() or dest.is_symlink():
-            return False
-        r = run(["findmnt", "-n", "-o", "UUID", "-T", str(dest)])
-        return r.returncode == 0 and r.stdout.strip() == cfg["root_uuid"]
+        with backup_volume(configuration()):
+            return True
     except Exception:
         return False
 
@@ -130,7 +128,7 @@ def main():
         try:
             events, cursor = journal_events(cursor)
             for line in events:
-                if "Starting DCIM backup" in line:
+                if "Starting media backup" in line:
                     pending = True
                     verified = completed = False
                     completed_at = away_since = None
@@ -141,7 +139,7 @@ def main():
                 elif "Backup completed safely for" in line and pending and verified:
                     completed = True
                     log.info("Backup completion confirmed")
-                elif any(s in line for s in ("Backup failed for", "Could not unmount", "Detection error:")):
+                elif any(s in line for s in ("Backup failed for", "Could not unmount", "Detection error")):
                     pending = verified = completed = False
                     completed_at = away_since = None
                     log.warning("Backup error; shutdown cancelled")

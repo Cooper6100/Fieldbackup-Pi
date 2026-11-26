@@ -1,42 +1,28 @@
-# FieldBackup Pi
+# FieldBackup Pi v0.2.0
 
-Portable Raspberry Pi 5 backup station for SD cards, USB camera media and DJI storage, with SHA-256 verification, a dedicated NVMe backup SSD, optional OLED, home SMB synchronization and conditional shutdown.
+FieldBackup automatically copies FAT/exFAT SD cards and USB camera storage to a dedicated backup NVMe. It verifies each file with SHA-256 before publication, preserves file timestamps, and keeps both copies when filenames collide. The importer scans visible files across the whole card, including folders outside `DCIM`.
 
-> **Beta software.** Test with disposable media and verify copies independently before trusting it with irreplaceable footage.
+The target is a Raspberry Pi 5 (16 GB) running Debian 13 Trixie ARM64, with a 512 GB OS NVMe and a separate 4 TB backup NVMe. The default destination is `/mnt/media/SD-Backups`. The SSD UUID, mount, OLED, RTC, reader filtering, disk reserve and GPIO settings are configurable.
 
-## Features
-- Automatically imports FAT/exFAT SD and USB media with a `DCIM` folder
-- Copies to `/mnt/media/SD-Backups` on a **separate NVMe backup filesystem**
-- SHA-256 verifies new files, skips identical copies and never deletes source media
-- Optional SSD1306 OLED and status LEDs
-- Optional home SMB synchronization (five-minute timer)
-- Optional automatic shutdown after a verified backup and 180 seconds idle on an approved away Wi-Fi profile
-- Shutdown watchdog **disabled by default**; its default setting is **dry run**
+## Install, upgrade or roll back
 
-## Requirements
-Raspberry Pi 5 with 64-bit Raspberry Pi OS booting from NVMe, a separate mounted backup NVMe at `/mnt/media`, stable power, and a USB SD-card reader. The installer is **for a fresh Pi only** and refuses to overwrite an existing FieldBackup installation.
+Read the [operating manual](docs/MANUAL.md) for the mount, packages, RTC and OLED prerequisites. Run the script without arguments to preview its managed paths. Add `--apply` on a staging or target machine when ready.
 
-## Installation
 ```bash
-git clone https://github.com/Cooper6100/Fieldbackup-Pi.git
-cd Fieldbackup-Pi
-sudo ./install.sh
-sudo ./configure-smb.sh  # optional
+./install.sh             # preview a fresh installation
+./upgrade.sh             # preview an existing installation upgrade
+./rollback.sh            # preview restoring the previous installation
 ```
 
-**Before installing:** mount your dedicated backup NVMe at `/mnt/media` using its own UUID in `/etc/fstab`. Never format a disk without checking its contents and identity.
+New imports go under `Cards/<volume-uuid>/` inside the configured destination. The upgrade keeps the existing backups and preserves your configured destination and UUID. Optional SMB sync independently copies published files, including earlier backup layouts. Keep the original media until you have checked an independent copy.
 
-For SMB and shutdown, copy `payload/fieldbackup-network.example.json` to `/etc/fieldbackup-network.json` and configure your own home network and approved hotspot profiles. **Never commit your local configuration or credentials.**
+## Tests and package
 
-See the [full installation and operating manual](docs/MANUAL.md) for mount setup, network configuration, logs, safe shutdown activation, and troubleshooting.
+```bash
+python3 -m unittest discover -s tests -v
+./scripts/package.sh /tmp/fieldbackup-package
+```
 
-## Safety
-- The optional watchdog is not automatically enabled and starts in dry-run mode.
-- A verified backup is not a substitute for keeping an independent copy.
-- Source media are never intentionally deleted.
-- Cards mounted read-only by another service are not automatically unmounted by the importer.
-- SMB synchronization requires a share supporting the file operations used by the sync script.
-- UPS telemetry and low-battery shutdown are not implemented.
+The package script archives the current Git commit and produces a SHA-256 checksum. The pull request workflow builds the package and uploads it as a GitHub Actions artifact.
 
-## License
-MIT — see [LICENSE](LICENSE).
+[MIT License](LICENSE)
