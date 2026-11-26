@@ -101,6 +101,38 @@ class FileCases(unittest.TestCase):
         self.assertEqual(self.copy(), "COPIED")
         self.assertFalse(stale.exists())
 
+    def test_recovery_after_worker_exits_without_cleanup(self):
+        code = """
+import os
+import sys
+import storage
+
+source, destination, staging = sys.argv[1:]
+storage.CHUNK = 4
+checks = 0
+
+def interrupt():
+    global checks
+    checks += 1
+    if checks == 4:
+        os._exit(42)
+
+with storage.directory(destination) as parent, storage.directory(staging) as stage:
+    storage.copy_verified(source, parent, "photo.jpg", stage, stop=interrupt)
+"""
+        env = os.environ | {"PYTHONPATH": str(ROOT / "payload/sd-field-backup")}
+        result = subprocess.run(
+            [sys.executable, "-c", code, str(self.src), str(self.dest), str(self.stage)],
+            env=env, check=False,
+        )
+        self.assertEqual(result.returncode, 42)
+        self.assertEqual(len(list(self.stage.iterdir())), 1)
+        self.assertFalse((self.dest / "photo.jpg").exists())
+        with storage.directory(self.stage) as stage:
+            storage.cleanup_staging(stage)
+        self.assertEqual(self.copy(), "COPIED")
+        self.assertEqual(list(self.stage.iterdir()), [])
+
     def test_corrupt_staging_is_not_published(self):
         with patch("storage.digest", side_effect=[hashlib.sha256(b"original").hexdigest(), "incorrect"]):
             with self.assertRaisesRegex(RuntimeError, "SHA-256"):
@@ -115,6 +147,17 @@ class FileCases(unittest.TestCase):
 
 
 class MountCases(unittest.TestCase):
+    def test_nested_mount_refused_before_creating_child(self):
+        with tempfile.TemporaryDirectory() as temp:
+            nested = Path(temp) / "nested"
+            nested.mkdir()
+            with storage.directory(temp) as fd, patch("storage.mount_id", side_effect=[100, 200]):
+                with self.assertRaisesRegex(RuntimeError, "Nested mount"), storage.directory(
+                    "nested/child", below=fd, create=True
+                ):
+                    pass
+            self.assertFalse((nested / "child").exists())
+
     def test_validate_identity_and_fail_closed(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp)
